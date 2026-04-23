@@ -1,0 +1,18 @@
+/**
+ * Outbound Worker — sits between the Sandbox container and the public internet.
+ *
+ * When the Sandbox is configured to use this Worker as its outbound service
+ * (see `services` binding in the parent worker.jsonc), every fetch() from
+ * inside the container lands here. We inject the Cloudflare API token on
+ * requests to api.cloudflare.com and pass everything else through.
+ *
+ * Set the secret with:   npx wrangler secret put CF_API_TOKEN --name github-for-agents-outbound
+ */
+{
+	"$schema": "../node_modules/wrangler/config-schema.json",
+	"name": "github-for-agents-outbound",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-04-23",
+	"compatibility_flags": ["nodejs_compat"],
+	"observability": { "enabled": true }
+}

@@ -1,11 +1,12 @@
-import { defineWorkersConfig } from "@cloudflare/vitest-pool-workers/config";
+import { defineConfig } from 'vitest/config';
 
-export default defineWorkersConfig({
+// Pure-Node config. The current @cloudflare/vitest-pool-workers release
+// doesn't understand the `artifacts` binding or remote service bindings in
+// wrangler.jsonc, so miniflare refuses to boot. The helper-level tests don't
+// need the Workers runtime — standard Node is fine.
+export default defineConfig({
 	test: {
-		poolOptions: {
-			workers: {
-				wrangler: { configPath: "./wrangler.jsonc" },
-			},
-		},
+		include: ['test/**/*.spec.ts'],
+		environment: 'node',
 	},
 });
