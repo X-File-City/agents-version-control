@@ -1,12 +1,43 @@
 import OAuthProvider from '@cloudflare/workers-oauth-provider';
-import { proxyToSandbox, type Sandbox as SandboxType } from '@cloudflare/sandbox';
+import {
+	//ContainerProxy,
+	proxyToSandbox,
+	Sandbox as BaseSandbox,
+	type Sandbox as SandboxType,
+} from '@cloudflare/sandbox';
 
 import { AgentsMcpServer } from './mcp/agent';
 import { defaultHandler } from './oauth';
 
 // Re-export DO classes so Wrangler can instantiate them by name.
 export { AgentsMcpServer };
-export { Sandbox } from '@cloudflare/sandbox';
+// Required for sandbox outbound interception to work.
+//export { ContainerProxy };
+export class Sandbox extends BaseSandbox {}
+
+// Disabled outbound interception. Wrangler auth now uses direct
+// CLOUDFLARE_API_TOKEN env injection in sandbox commands.
+// Sandbox.outbound = (request: Request, env: OutboundEnv): Response | Promise<Response> => {
+// 	const url = new URL(request.url);
+// 	if (url.hostname === CF_API_HOST) {
+// 		if (!env.API_TOKEN) {
+// 			return new Response('sandbox outbound missing API_TOKEN secret', { status: 500 });
+// 		}
+//
+// 		url.protocol = 'https:';
+// 		const headers = new Headers(request.headers);
+// 		headers.set('Authorization', `Bearer ${env.API_TOKEN}`);
+//
+// 		return fetch(url.toString(), {
+// 			method: request.method,
+// 			headers,
+// 			body: request.body,
+// 			redirect: 'manual',
+// 		});
+// 	}
+//
+// 	return fetch(request);
+// };
 
 // The OAuth provider handles /authorize, /token, /register, and /.well-known/*.
 // Everything under /mcp requires a valid access token and is dispatched to the
@@ -34,7 +65,7 @@ export default {
 		// Sandbox preview URLs (unused in v1 but cheap to wire up).
 		const proxied = await proxyToSandbox(
 			request,
-			env as unknown as { Sandbox: DurableObjectNamespace<SandboxType> },
+			{ Sandbox: env.SANDBOX } as { Sandbox: DurableObjectNamespace<SandboxType> },
 		);
 		if (proxied) return proxied;
 

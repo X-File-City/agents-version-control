@@ -5,6 +5,7 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "github-for-agents",
+	"account_id": "d32e32cb20387d14c4f45965620063cc",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-04-23",
 	"compatibility_flags": ["nodejs_compat"],
@@ -13,7 +14,7 @@
 
 	"durable_objects": {
 		"bindings": [
-			{ "name": "MCP_AGENT", "class_name": "AgentsMcpServer" },
+			{ "name": "MCP_OBJECT", "class_name": "AgentsMcpServer" },
 			{ "name": "SANDBOX", "class_name": "Sandbox" }
 		]
 	},
@@ -40,9 +41,5 @@
 
 	"artifacts": [
 		{ "binding": "ARTIFACTS", "namespace": "github-for-agents" }
-	],
-
-	"services": [
-		{ "binding": "OUTBOUND", "service": "github-for-agents-outbound" }
 	]
 }

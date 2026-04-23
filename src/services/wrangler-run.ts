@@ -1,22 +1,24 @@
 import { sh, type SandboxHandle, type ShellResult } from './sandbox';
+import { CLOUDFLARE_ACCOUNT_ID } from './wrangler';
 
-// Run wrangler with the CF creds coming in via the Outbound Worker (not via
-// env vars inside the sandbox). Wrangler still expects *some* auth hint to
-// avoid prompting, so we set CLOUDFLARE_API_TOKEN to a placeholder that the
-// Outbound Worker will replace with the real token at egress.
-const PLACEHOLDER_TOKEN = 'placeholder-replaced-at-egress';
+// Run wrangler with CF creds passed directly into sandbox command env.
 
 export async function wrangler(
 	sb: SandboxHandle,
 	args: string,
 	cwd: string,
+	apiToken: string,
+	timeoutMs = 300_000,
 ): Promise<ShellResult> {
-	return sh(sb, `npx wrangler ${args}`, {
+	// `npx --yes` avoids interactive install prompts when wrangler isn't
+	// present in the target repo yet.
+	return sh(sb, `npx --yes wrangler ${args}`, {
 		cwd,
 		env: {
-			CLOUDFLARE_API_TOKEN: PLACEHOLDER_TOKEN,
+			CLOUDFLARE_API_TOKEN: apiToken,
+			CLOUDFLARE_ACCOUNT_ID,
 			CI: 'true',
 		},
-		timeoutMs: 180_000,
+		timeoutMs,
 	});
 }

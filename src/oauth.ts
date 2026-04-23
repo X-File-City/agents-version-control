@@ -41,7 +41,9 @@ export const defaultHandler: ExportedHandler<OAuthEnv> = {
 			// A stable subject per agent name. In production we'd mint a UUID on
 			// first sign-up and look it up by name thereafter; for the demo this
 			// is good enough.
-			const userId = `agent:${hashName(agentName)}`;
+			// workers-oauth-provider serializes codes/tokens as `${userId}:${grantId}:${secret}`;
+			// userId must therefore avoid ":" to keep that format unambiguous.
+			const userId = `agent_${hashName(agentName)}`;
 
 			const result = await env.OAUTH_PROVIDER.completeAuthorization({
 				request: parsed,

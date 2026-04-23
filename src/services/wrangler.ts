@@ -6,10 +6,13 @@
 // A minimal wrangler.jsonc we commit as the initial repo payload so that
 // `wrangler versions upload` works out-of-the-box. The agent is free to
 // replace it with anything valid.
+export const CLOUDFLARE_ACCOUNT_ID = 'd32e32cb20387d14c4f45965620063cc';
+
 export function initialWranglerConfig(workerName: string): string {
 	const config = {
 		$schema: 'node_modules/wrangler/config-schema.json',
 		name: workerName,
+		account_id: CLOUDFLARE_ACCOUNT_ID,
 		main: 'src/index.ts',
 		compatibility_date: '2026-04-23',
 		compatibility_flags: ['nodejs_compat'],
@@ -34,8 +37,11 @@ export function initialPackageJson(workerName: string): string {
 		private: true,
 		version: '0.0.0',
 		scripts: {
-			deploy: 'wrangler deploy',
-			dev: 'wrangler dev',
+			deploy: `CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID} wrangler deploy`,
+			dev: `CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID} wrangler dev`,
+		},
+		devDependencies: {
+			wrangler: '^4.84.1',
 		},
 	};
 	return JSON.stringify(pkg, null, '\t') + '\n';
@@ -45,6 +51,21 @@ export interface UploadedVersion {
 	versionId: string;
 	previewUrl: string | null;
 	raw: string;
+}
+
+interface CloudflareApiError {
+	code?: number;
+	message?: string;
+}
+
+interface WorkersScriptSummary {
+	id?: string;
+}
+
+interface WorkersScriptsListResponse {
+	success?: boolean;
+	result?: WorkersScriptSummary[];
+	errors?: CloudflareApiError[];
 }
 
 // `wrangler versions upload` prints a human-readable block. The exact JSON
@@ -60,4 +81,27 @@ export function parseVersionsUpload(stdout: string): UploadedVersion | null {
 		previewUrl: previewMatch ? previewMatch[0] : null,
 		raw: stdout,
 	};
+}
+
+export function parseWorkersScriptList(
+	payload: unknown,
+	workerName: string,
+): { exists: boolean; error: string | null } {
+	const body = payload as WorkersScriptsListResponse | null;
+	if (!body || typeof body !== 'object') {
+		return { exists: false, error: 'workers/scripts returned a non-object response' };
+	}
+
+	if (body.success !== true) {
+		const firstError = body.errors?.[0];
+		const detail = firstError?.message?.trim();
+		return {
+			exists: false,
+			error: detail ? `workers/scripts API reported an error: ${detail}` : 'workers/scripts API reported an error',
+		};
+	}
+
+	const scripts = Array.isArray(body.result) ? body.result : [];
+	const exists = scripts.some((script) => script?.id === workerName);
+	return { exists, error: null };
 }

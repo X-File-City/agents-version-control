@@ -3,11 +3,11 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev",
-    "start": "wrangler dev",
+    "deploy": "CLOUDFLARE_ACCOUNT_ID=d32e32cb20387d14c4f45965620063cc wrangler deploy",
+    "dev": "CLOUDFLARE_ACCOUNT_ID=d32e32cb20387d14c4f45965620063cc wrangler dev",
+    "start": "CLOUDFLARE_ACCOUNT_ID=d32e32cb20387d14c4f45965620063cc wrangler dev",
     "test": "vitest",
-    "cf-typegen": "wrangler types"
+    "cf-typegen": "CLOUDFLARE_ACCOUNT_ID=d32e32cb20387d14c4f45965620063cc wrangler types"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.12.4",
@@ -21,6 +21,8 @@
     "@cloudflare/workers-oauth-provider": "^0.4.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "agents": "^0.11.5",
+    "isomorphic-git": "^1.37.5",
+    "memfs": "^4.57.2",
     "zod": "^4.3.6"
   }
 }

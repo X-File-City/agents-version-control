@@ -13,13 +13,9 @@ import {
 	gitUrlWithToken,
 } from '../services/artifacts';
 import { sandboxFor, sh } from '../services/sandbox';
-import {
-	initialPackageJson,
-	initialWorkerSource,
-	initialWranglerConfig,
-} from '../services/wrangler';
 import { wrangler } from '../services/wrangler-run';
 import { runBuild } from '../builds/runner';
+import { seedRepoInMemory } from '../services/repo-seed';
 
 export interface AgentProps extends Record<string, unknown> {
 	userId: string;       // OAuth subject — also the DO id
@@ -110,8 +106,8 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 							type: 'text',
 							text: JSON.stringify(
 								{
-									git_url: gitUrlWithToken(access.remote, access.token),
-									remote: access.remote,
+									git_url: gitUrlWithToken(repo.git_url, access.token),
+									remote: repo.git_url,
 									username: 'x-access-token',
 									token: access.token,
 									expires_at: access.expiresAt,
@@ -159,15 +155,9 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 					VALUES (${buildId}, ${repo_id}, ${ref}, 'queued', ${now}, ${now})
 				`;
 
-				// Fire-and-forget; keep the DO alive until the build settles.
-				this.ctx.waitUntil(
-					runBuild({
-						env: this.env,
-						sql: (strings, ...values) => this.sql(strings, ...values),
-						build: this.sql<BuildRow>`SELECT * FROM builds WHERE id = ${buildId}`[0],
-						repo,
-					}),
-				);
+				// Queue build execution onto the agent scheduler so request lifetime
+				// is decoupled from long-running build work.
+				await this.schedule(1, 'runPreviewBuild', { buildId, repoId: repo.id });
 
 				return { content: [{ type: 'text', text: JSON.stringify({ build_id: buildId, status: 'queued' }) }] };
 			},
@@ -207,6 +197,32 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 
 	// ── Complex tool bodies extracted for readability ─────────────────────
 
+	async runPreviewBuild(payload: { buildId: string; repoId: string }): Promise<void> {
+		const buildRows = this.sql<BuildRow>`SELECT * FROM builds WHERE id = ${payload.buildId}`;
+		if (buildRows.length === 0) return;
+		const repoRows = this.sql<RepoRow>`SELECT * FROM repos WHERE id = ${payload.repoId}`;
+		if (repoRows.length === 0) {
+			const now = Date.now();
+			this.sql`
+				UPDATE builds SET
+					status = 'failed',
+					error = 'repo not found',
+					updated_at = ${now}
+				WHERE id = ${payload.buildId}
+			`;
+			return;
+		}
+
+		await this.runFiber('preview-build', async () => {
+			await runBuild({
+				env: this.env,
+				sql: (strings, ...values) => this.sql(strings, ...values),
+				build: buildRows[0],
+				repo: repoRows[0],
+			});
+		});
+	}
+
 	private async handleCreateRepo(
 		name: string,
 		workerName: string,
@@ -221,16 +237,46 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 
 		const provisioned = await provisionRepo(this.env.ARTIFACTS, agentId, name, description);
 
-		// Seed the repo with a minimal Worker scaffold so `wrangler versions upload`
-		// works immediately. We push from a sandbox with the freshly-minted write token.
 		const repoId = ulid();
-		const gitUrl = gitUrlWithToken(provisioned.remote, provisioned.writeToken);
-		await this.seedRepo({
-			buildScratchId: `seed-${repoId}`,
-			gitUrl,
+		const seedGitUrl = gitUrlWithToken(provisioned.remote, provisioned.writeToken);
+		console.info('[create_repo] provisioned artifacts repo', {
+			repoId,
+			repoName: name,
 			workerName,
-			displayName,
+			remote: this.redactCredentials(seedGitUrl),
 		});
+		try {
+			// Seed the repo with a minimal Worker scaffold so `wrangler versions upload`
+			// works immediately.
+			await this.seedRepo({
+				gitUrl: seedGitUrl,
+				workerName,
+				displayName,
+			});
+		} catch (err) {
+			const reason = err instanceof Error ? err.message : String(err);
+			console.error('[create_repo] seed failed', {
+				repoId,
+				repoName: name,
+				workerName,
+				remote: this.redactCredentials(seedGitUrl),
+				error: reason,
+			});
+			try {
+				await deleteRepo(this.env.ARTIFACTS, provisioned.artifactsRepoName);
+				console.warn('[create_repo] cleaned up provisioned repo after seed failure', {
+					repoId,
+					artifactsRepoName: provisioned.artifactsRepoName,
+				});
+			} catch (cleanupErr) {
+				console.error('[create_repo] cleanup failed after seed failure', {
+					repoId,
+					artifactsRepoName: provisioned.artifactsRepoName,
+					error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+				});
+			}
+			throw new Error(`seed failed: ${reason}`);
+		}
 
 		const now = Date.now();
 		this.sql`
@@ -251,32 +297,23 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 	}
 
 	private async seedRepo(args: {
-		buildScratchId: string;
 		gitUrl: string;
 		workerName: string;
 		displayName: string;
 	}): Promise<void> {
-		const sb = sandboxFor(
-			this.env.SANDBOX as unknown as DurableObjectNamespace<SandboxType>,
-			args.buildScratchId,
-		);
-		const dir = '/workspace/seed';
-		await sh(sb, `rm -rf ${dir} && mkdir -p ${dir}/src`);
-		await sb.writeFile(`${dir}/wrangler.jsonc`, initialWranglerConfig(args.workerName));
-		await sb.writeFile(`${dir}/src/index.ts`, initialWorkerSource());
-		await sb.writeFile(`${dir}/package.json`, initialPackageJson(args.workerName));
-		await sb.writeFile(`${dir}/.gitignore`, 'node_modules\n.wrangler\n');
-		const init = [
-			`cd ${dir}`,
-			'git init -q -b main',
-			`git config user.email "${args.displayName}@github-for-agents.local"`,
-			`git config user.name "${args.displayName}"`,
-			'git add .',
-			'git commit -q -m "initial commit (seeded by github-for-agents)"',
-			`git remote add origin "${args.gitUrl}"`,
-			'git push -q -u origin main',
-		].join(' && ');
-		await sh(sb, init, { timeoutMs: 120_000 });
+		console.info('[seed] start', {
+			workerName: args.workerName,
+			displayName: args.displayName,
+			remote: this.redactCredentials(args.gitUrl),
+		});
+		await seedRepoInMemory({
+			gitUrl: args.gitUrl,
+			workerName: args.workerName,
+			displayName: args.displayName,
+		});
+		console.info('[seed] complete', {
+			workerName: args.workerName,
+		});
 	}
 
 	private async handlePromote(buildId: string): Promise<{ deployment_id: string; status: string; worker_version_id: string }> {
@@ -303,12 +340,12 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 		);
 		// Fresh checkout of the deployed ref so wrangler has the config.
 		const access = await mintAccess(this.env.ARTIFACTS, repo.artifacts_repo_name, 'read', 600);
-		const authedUrl = gitUrlWithToken(access.remote, access.token);
+		const authedUrl = gitUrlWithToken(repo.git_url, access.token);
 		const dir = '/workspace/deploy';
 		const checkout = `rm -rf ${dir} && git clone --quiet ${authedUrl} ${dir} && cd ${dir} && git checkout ${build.commit_sha ?? 'HEAD'}`;
 		await sh(sb, checkout, { timeoutMs: 120_000 });
 
-		const install = await sh(sb, 'npm install --no-audit --no-fund', { cwd: dir, timeoutMs: 180_000 });
+		const install = await sh(sb, 'npm install --no-audit --no-fund', { cwd: dir, timeoutMs: 300_000 });
 		if (!install.success) {
 			this.sql`UPDATE deployments SET status = 'failed' WHERE id = ${deploymentId}`;
 			throw new Error(`install failed during promote: ${install.stderr}`);
@@ -316,7 +353,17 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 
 		// Deploy the specific version at 100%. This keeps promote a pure
 		// traffic-shift action — no rebuild.
-		const deploy = await wrangler(sb, `versions deploy ${build.worker_version_id}@100% --message "promote build ${buildId}" --yes`, dir);
+		const apiToken = (this.env as Cloudflare.Env & { API_TOKEN?: string }).API_TOKEN;
+		if (!apiToken) {
+			this.sql`UPDATE deployments SET status = 'failed' WHERE id = ${deploymentId}`;
+			throw new Error('missing API_TOKEN secret for wrangler deploy');
+		}
+		const deploy = await wrangler(
+			sb,
+			`versions deploy ${build.worker_version_id}@100% --message "promote build ${buildId}" --yes`,
+			dir,
+			apiToken,
+		);
 		if (!deploy.success) {
 			this.sql`UPDATE deployments SET status = 'failed' WHERE id = ${deploymentId}`;
 			throw new Error(`wrangler versions deploy failed: ${deploy.stderr}`);
@@ -334,6 +381,19 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 			INSERT INTO audit_log (action, target_type, target_id, metadata, ts)
 			VALUES (${action}, ${targetType}, ${targetId}, ${JSON.stringify(metadata)}, ${Date.now()})
 		`;
+	}
+
+	private redactCredentials(url: string): string {
+		try {
+			const parsed = new URL(url);
+			if (parsed.username || parsed.password) {
+				parsed.username = parsed.username ? 'x-access-token' : '';
+				parsed.password = parsed.password ? '***' : '';
+			}
+			return parsed.toString();
+		} catch {
+			return '<invalid-url>';
+		}
 	}
 }
 
