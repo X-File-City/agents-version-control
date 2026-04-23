@@ -4,20 +4,22 @@
 // Triggered from the agent via durable execution (`runFiber`). Detects project type, invokes the right install
 // + build + upload commands inside a sandbox, and records progress in SQL.
 
-import type { Sandbox as SandboxType } from '@cloudflare/sandbox';
 import { mintAccess, gitUrlWithToken } from '../services/artifacts';
-import { sandboxFor, sh, tailLogs, gitCheckout, type ShellResult } from '../services/sandbox';
-import { CLOUDFLARE_ACCOUNT_ID, parseVersionsUpload, parseWorkersScriptList } from '../services/wrangler';
+import {
+	sandboxFor,
+	sandboxIdForBuild,
+	sandboxNamespace,
+	sh,
+	tailLogs,
+	gitCheckout,
+	type ShellResult,
+} from '../services/sandbox';
+import { parseVersionsUpload, parseWorkersScriptList } from '../services/wrangler';
+import { CLOUDFLARE_ACCOUNT_ID } from '../config';
 import { wrangler } from '../services/wrangler-run';
+import { errorMessage } from '../util/errors';
+import type { SqlRunner } from '../db/queries';
 import type { BuildRow, BuildStatus, RepoRow } from '../db/schema';
-
-export interface SqlRunner {
-	// Tagged-template SQL API exposed by McpAgent.
-	<T = Record<string, string | number | boolean | null>>(
-		strings: TemplateStringsArray,
-		...values: (string | number | boolean | null)[]
-	): T[];
-}
 
 interface RunBuildArgs {
 	env: Cloudflare.Env;
@@ -30,10 +32,7 @@ const WORKDIR = '/workspace/repo';
 const WRANGLER_UPLOAD_TIMEOUT_MS = 900_000;
 
 export async function runBuild({ env, sql, build, repo }: RunBuildArgs): Promise<void> {
-	const sb = sandboxFor(
-		env.SANDBOX as unknown as DurableObjectNamespace<SandboxType>,
-		build.id,
-	);
+	const sb = sandboxFor(sandboxNamespace(env), sandboxIdForBuild(build.id));
 	const logPrefix = `[build:${build.id}]`;
 
 	const logs: string[] = [];
@@ -149,7 +148,7 @@ export async function runBuild({ env, sql, build, repo }: RunBuildArgs): Promise
 		// 4. Upload preview version via wrangler using a real API token passed
 		//    directly into the sandbox command environment.
 		setStatus('uploading');
-		const apiToken = (env as Cloudflare.Env & { API_TOKEN?: string }).API_TOKEN;
+		const apiToken = env.API_TOKEN;
 		if (!apiToken) {
 			setStatus('failed', { error: 'missing API_TOKEN secret' });
 			return;
@@ -224,10 +223,9 @@ async function ensureWorkerScriptExists(args: {
 			},
 		);
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
 		return {
 			exists: false,
-			error: `workers/scripts lookup failed: ${message}`,
+			error: `workers/scripts lookup failed: ${errorMessage(err)}`,
 		};
 	}
 	if (!res.ok) {

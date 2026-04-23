@@ -1,12 +1,23 @@
 import { getSandbox, type Sandbox as SandboxType } from '@cloudflare/sandbox';
+import { errorMessage } from '../util/errors';
 
 export type SandboxHandle = ReturnType<typeof getSandbox<SandboxType>>;
+
+// Wrangler types SANDBOX as the subclass; the SDK expects the base type.
+export function sandboxNamespace(env: Cloudflare.Env): DurableObjectNamespace<SandboxType> {
+	return env.SANDBOX as unknown as DurableObjectNamespace<SandboxType>;
+}
 
 export function sandboxFor(
 	namespace: DurableObjectNamespace<SandboxType>,
 	id: string,
 ): SandboxHandle {
 	return getSandbox(namespace, id);
+}
+
+// Build and deploy steps for the same preview should share one sandbox.
+export function sandboxIdForBuild(buildId: string): string {
+	return buildId;
 }
 
 export interface ShellResult {
@@ -46,7 +57,7 @@ export async function sh(
 	} catch (err) {
 		return {
 			stdout: '',
-			stderr: err instanceof Error ? err.message : String(err),
+			stderr: errorMessage(err),
 			exitCode: -1,
 			success: false,
 			command,
@@ -62,10 +73,7 @@ export async function gitCheckout(
 	opts?: GitCheckoutOptions,
 ): Promise<ShellResult> {
 	try {
-		const maybeGit = sb as unknown as {
-			gitCheckout?: (url: string, options?: GitCheckoutOptions) => Promise<unknown>;
-		};
-		if (typeof maybeGit.gitCheckout !== 'function') {
+		if (!('gitCheckout' in sb) || typeof (sb as unknown as Record<string, unknown>).gitCheckout !== 'function') {
 			return {
 				stdout: '',
 				stderr: 'sandbox gitCheckout API not available',
@@ -74,7 +82,7 @@ export async function gitCheckout(
 				command: 'gitCheckout',
 			};
 		}
-		await maybeGit.gitCheckout(repoUrl, opts);
+		await (sb as unknown as { gitCheckout: (url: string, options?: GitCheckoutOptions) => Promise<unknown> }).gitCheckout(repoUrl, opts);
 		return {
 			stdout: '',
 			stderr: '',
@@ -85,7 +93,7 @@ export async function gitCheckout(
 	} catch (err) {
 		return {
 			stdout: '',
-			stderr: err instanceof Error ? err.message : String(err),
+			stderr: errorMessage(err),
 			exitCode: -1,
 			success: false,
 			command: 'gitCheckout',

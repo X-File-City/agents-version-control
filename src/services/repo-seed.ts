@@ -7,6 +7,8 @@ import {
 	initialWorkerSource,
 	initialWranglerConfig,
 } from './wrangler';
+import { redactCredentials } from '../util/urls';
+import { errorMessage } from '../util/errors';
 
 const SEED_DIR = '/seed';
 
@@ -46,10 +48,9 @@ export async function seedRepoInMemory(args: SeedRepoArgs): Promise<void> {
 			},
 		});
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
 		console.error('[seed] clone failed', {
 			remote: redactedRemote,
-			error: message,
+			error: errorMessage(err),
 		});
 		throw err;
 	}
@@ -80,26 +81,9 @@ export async function seedRepoInMemory(args: SeedRepoArgs): Promise<void> {
 		defaultBranch: 'main',
 	});
 
-	await git.add({
-		fs: gitFs,
-		dir: SEED_DIR,
-		filepath: 'wrangler.jsonc',
-	});
-	await git.add({
-		fs: gitFs,
-		dir: SEED_DIR,
-		filepath: 'src/index.ts',
-	});
-	await git.add({
-		fs: gitFs,
-		dir: SEED_DIR,
-		filepath: 'package.json',
-	});
-	await git.add({
-		fs: gitFs,
-		dir: SEED_DIR,
-		filepath: '.gitignore',
-	});
+	for (const filepath of ['wrangler.jsonc', 'src/index.ts', 'package.json', '.gitignore']) {
+		await git.add({ fs: gitFs, dir: SEED_DIR, filepath });
+	}
 
 	const author = {
 		name: args.displayName,
@@ -129,10 +113,9 @@ export async function seedRepoInMemory(args: SeedRepoArgs): Promise<void> {
 		});
 		console.info('[seed] push complete', { remote: redactedRemote });
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
 		console.error('[seed] push failed', {
 			remote: redactedRemote,
-			error: message,
+			error: errorMessage(err),
 		});
 		throw err;
 	}
@@ -183,15 +166,3 @@ async function ensureMainBranch(fs: Parameters<typeof git.clone>[0]['fs']): Prom
 	});
 }
 
-function redactCredentials(url: string): string {
-	try {
-		const parsed = new URL(url);
-		if (parsed.username || parsed.password) {
-			parsed.username = parsed.username ? 'x-access-token' : '';
-			parsed.password = parsed.password ? '***' : '';
-		}
-		return parsed.toString();
-	} catch {
-		return '<invalid-url>';
-	}
-}
