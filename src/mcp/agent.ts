@@ -3,13 +3,22 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import { SCHEMA } from '../db/schema';
-import type { BuildRow, DeploymentRow, RepoRow } from '../db/schema';
-import { getRepo, getBuild, getDeployment } from '../db/queries';
+import type { BuildRow, DeploymentRow, PullRequestRow, RepoRow } from '../db/schema';
+import { getRepo, getBuild, getDeployment, getPullRequest, listPullRequests } from '../db/queries';
 import type { SqlRunner } from '../db/queries';
 import { ulid } from '../util/ids';
 import { deleteRepo, mintAccess, gitUrlWithToken } from '../services/artifacts';
 import { runBuild } from '../builds/runner';
-import { handleCreateRepo, handlePromote, runPromote, type HandlerContext } from './handlers';
+import {
+	handleCreateRepo,
+	handlePromote,
+	handleCreatePullRequest,
+	handleGetPullRequest,
+	handleApprovePullRequest,
+	handleMergePullRequest,
+	runPromote,
+	type HandlerContext,
+} from './handlers';
 
 export interface AgentProps extends Record<string, unknown> {
 	userId: string;       // OAuth subject — also the DO id
@@ -183,6 +192,75 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 				return { content: [{ type: 'text', text: JSON.stringify(deployment, null, 2) }] };
 			},
 		);
+
+		// ── Pull Request tools ──────────────────────────────────────────
+
+		server.tool(
+			'create_pull_request',
+			'Create a pull request to merge changes from head_branch into base_branch.',
+			{
+				repo_id: z.string(),
+				head_branch: z.string(),
+				base_branch: z.string().optional(),
+				title: z.string().min(1).max(200),
+				description: z.string().max(2000).optional(),
+			},
+			async ({ repo_id, head_branch, base_branch, title, description }) => {
+				const result = await handleCreatePullRequest(this.handlerCtx, repo_id, head_branch, base_branch, title, description);
+				return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+			},
+		);
+
+		server.tool(
+			'list_pull_requests',
+			'List pull requests for a repo, newest first (max 10).',
+			{ repo_id: z.string() },
+			async ({ repo_id }) => {
+				getRepo(this.sqlRunner, repo_id);
+				const rows = listPullRequests(this.sqlRunner, repo_id);
+				return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
+			},
+		);
+
+		server.tool(
+			'get_pull_request',
+			'Get a pull request with a unified diff between head and base branches.',
+			{ pull_request_id: z.string() },
+			async ({ pull_request_id }) => {
+				const result = await handleGetPullRequest(this.handlerCtx, pull_request_id);
+				return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+			},
+		);
+
+		server.tool(
+			'approve_pull_request',
+			'Approve a pull request. Only open PRs can be approved.',
+			{ pull_request_id: z.string() },
+			async ({ pull_request_id }) => {
+				const result = await handleApprovePullRequest(this.handlerCtx, pull_request_id);
+				return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+			},
+		);
+
+		server.tool(
+			'merge_pull_request',
+			'Merge an approved pull request. Only the original requester can merge. Optionally triggers a build and deploy of the base branch.',
+			{
+				pull_request_id: z.string(),
+				deploy: z.boolean().default(false),
+			},
+			async ({ pull_request_id, deploy }) => {
+				const result = await handleMergePullRequest(this.handlerCtx, pull_request_id, deploy);
+				if (result.build_id) {
+					const pr = result.pull_request;
+					await this.schedule(1, 'runMergeDeploy', {
+						buildId: result.build_id,
+						repoId: pr.repo_id,
+					});
+				}
+				return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+			},
+		);
 	}
 
 	// ── Scheduled entry points ──────────────────────────────────────────
@@ -216,6 +294,34 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 	async runPromotePreview(payload: { buildId: string; deploymentId: string }): Promise<void> {
 		await this.runFiber('promote-preview', async () => {
 			await runPromote(this.handlerCtx, payload.buildId, payload.deploymentId);
+		});
+	}
+
+	async runMergeDeploy(payload: { buildId: string; repoId: string }): Promise<void> {
+		const buildRows = this.sql<BuildRow>`SELECT * FROM builds WHERE id = ${payload.buildId}`;
+		if (buildRows.length === 0) return;
+		const repoRows = this.sql<RepoRow>`SELECT * FROM repos WHERE id = ${payload.repoId}`;
+		if (repoRows.length === 0) {
+			const now = Date.now();
+			this.sql`UPDATE builds SET status = 'failed', error = 'repo not found', updated_at = ${now} WHERE id = ${payload.buildId}`;
+			return;
+		}
+
+		await this.runFiber('merge-deploy', async () => {
+			// Run the build
+			await runBuild({
+				env: this.env,
+				sql: (strings, ...values) => this.sql(strings, ...values),
+				build: buildRows[0],
+				repo: repoRows[0],
+			});
+
+			// If build succeeded, auto-promote
+			const built = getBuild(this.sqlRunner, payload.buildId);
+			if (built.status !== 'complete' || !built.worker_version_id) return;
+
+			const result = await handlePromote(this.handlerCtx, payload.buildId);
+			await runPromote(this.handlerCtx, payload.buildId, result.deployment_id);
 		});
 	}
 

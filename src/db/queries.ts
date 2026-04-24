@@ -1,4 +1,4 @@
-import type { RepoRow, BuildRow, DeploymentRow } from './schema';
+import type { RepoRow, BuildRow, DeploymentRow, PullRequestRow } from './schema';
 
 // Tagged-template SQL API exposed by McpAgent's `this.sql`.
 export interface SqlRunner {
@@ -24,4 +24,14 @@ export function getDeployment(sql: SqlRunner, deploymentId: string): DeploymentR
 	const rows = sql<DeploymentRow>`SELECT * FROM deployments WHERE id = ${deploymentId}`;
 	if (rows.length === 0) throw new Error(`deployment ${deploymentId} not found`);
 	return rows[0];
+}
+
+export function getPullRequest(sql: SqlRunner, prId: string): PullRequestRow {
+	const rows = sql<PullRequestRow>`SELECT * FROM pull_requests WHERE id = ${prId}`;
+	if (rows.length === 0) throw new Error(`pull request ${prId} not found`);
+	return rows[0];
+}
+
+export function listPullRequests(sql: SqlRunner, repoId: string): PullRequestRow[] {
+	return sql<PullRequestRow>`SELECT * FROM pull_requests WHERE repo_id = ${repoId} AND status != 'closed' ORDER BY created_at DESC LIMIT 10`;
 }

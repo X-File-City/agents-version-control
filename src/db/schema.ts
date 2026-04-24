@@ -50,6 +50,25 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_builds_repo ON builds(repo_id);
 CREATE INDEX IF NOT EXISTS idx_deploys_repo ON deployments(repo_id);
+CREATE TABLE IF NOT EXISTS pull_requests (
+	id TEXT PRIMARY KEY,
+	repo_id TEXT NOT NULL,
+	head_branch TEXT NOT NULL,
+	base_branch TEXT NOT NULL,
+	title TEXT NOT NULL,
+	description TEXT,
+	status TEXT NOT NULL DEFAULT 'open',
+	requested_by_id TEXT NOT NULL,
+	requested_by_name TEXT NOT NULL,
+	approved_by_id TEXT,
+	approved_by_name TEXT,
+	approved_at INTEGER,
+	merged_at INTEGER,
+	merged_commit_sha TEXT,
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pr_repo ON pull_requests(repo_id);
 `;
 
 // Row types — these reflect the SQL columns above.
@@ -105,4 +124,25 @@ export interface DeploymentRow {
 	environment: string;
 	status: DeploymentStatus;
 	created_at: number;
+}
+
+export type PullRequestStatus = 'open' | 'approved' | 'merged' | 'closed';
+
+export interface PullRequestRow {
+	id: string;
+	repo_id: string;
+	head_branch: string;
+	base_branch: string;
+	title: string;
+	description: string | null;
+	status: PullRequestStatus;
+	requested_by_id: string;
+	requested_by_name: string;
+	approved_by_id: string | null;
+	approved_by_name: string | null;
+	approved_at: number | null;
+	merged_at: number | null;
+	merged_commit_sha: string | null;
+	created_at: number;
+	updated_at: number;
 }

@@ -2,9 +2,9 @@
 // These are standalone functions that receive a context object
 // rather than being methods on the agent class.
 
-import type { BuildRow, RepoRow } from '../db/schema';
+import type { BuildRow, PullRequestRow, RepoRow } from '../db/schema';
 import type { SqlRunner } from '../db/queries';
-import { getBuild, getRepo } from '../db/queries';
+import { getBuild, getPullRequest, getRepo } from '../db/queries';
 import { ulid } from '../util/ids';
 import { errorMessage } from '../util/errors';
 import { redactCredentials } from '../util/urls';
@@ -17,6 +17,7 @@ import {
 import { sandboxFor, sandboxIdForBuild, sandboxNamespace, sh } from '../services/sandbox';
 import { wrangler } from '../services/wrangler-run';
 import { seedRepoInMemory } from '../services/repo-seed';
+import { generateDiff, performMerge } from '../services/git-ops';
 import type { AgentProps } from './agent';
 
 export interface HandlerContext {
@@ -179,4 +180,160 @@ export async function runPromote(
 	} catch {
 		ctx.sql`UPDATE deployments SET status = 'failed' WHERE id = ${deploymentId}`;
 	}
+}
+
+// ── Pull Request handlers ──────────────────────────────────────────
+
+export async function handleCreatePullRequest(
+	ctx: HandlerContext,
+	repoId: string,
+	headBranch: string,
+	baseBranch: string | undefined,
+	title: string,
+	description?: string,
+): Promise<PullRequestRow> {
+	const repo = getRepo(ctx.sql, repoId);
+	const base = baseBranch ?? repo.default_branch;
+
+	if (headBranch === base) {
+		throw new Error('head_branch and base_branch must be different');
+	}
+
+	const existing = ctx.sql<PullRequestRow>`
+		SELECT id FROM pull_requests
+		WHERE repo_id = ${repoId}
+			AND head_branch = ${headBranch}
+			AND base_branch = ${base}
+			AND status IN ('open', 'approved')
+	`;
+	if (existing.length > 0) {
+		throw new Error(`An open pull request already exists for ${headBranch} → ${base}`);
+	}
+
+	const requesterId = ctx.props?.userId ?? 'anonymous';
+	const requesterName = ctx.props?.displayName ?? 'agent';
+	const prId = ulid();
+	const now = Date.now();
+
+	ctx.sql`
+		INSERT INTO pull_requests
+			(id, repo_id, head_branch, base_branch, title, description, status,
+			 requested_by_id, requested_by_name, created_at, updated_at)
+		VALUES
+			(${prId}, ${repoId}, ${headBranch}, ${base}, ${title}, ${description ?? null}, 'open',
+			 ${requesterId}, ${requesterName}, ${now}, ${now})
+	`;
+
+	ctx.audit('create_pull_request', 'pull_request', prId, {
+		repo_id: repoId,
+		head_branch: headBranch,
+		base_branch: base,
+		title,
+	});
+
+	return getPullRequest(ctx.sql, prId);
+}
+
+export async function handleGetPullRequest(
+	ctx: HandlerContext,
+	prId: string,
+): Promise<{ pull_request: PullRequestRow; diff: string; stats: { files_changed: number; additions: number; deletions: number } }> {
+	const pr = getPullRequest(ctx.sql, prId);
+	const repo = getRepo(ctx.sql, pr.repo_id);
+
+	const access = await mintAccess(ctx.env.ARTIFACTS, repo.artifacts_repo_name, 'read', 300);
+	const authedUrl = gitUrlWithToken(repo.git_url, access.token);
+
+	const { diff, stats } = await generateDiff(authedUrl, pr.base_branch, pr.head_branch);
+
+	return { pull_request: pr, diff, stats };
+}
+
+export async function handleApprovePullRequest(
+	ctx: HandlerContext,
+	prId: string,
+): Promise<PullRequestRow> {
+	const pr = getPullRequest(ctx.sql, prId);
+
+	if (pr.status !== 'open') {
+		throw new Error(`Cannot approve pull request with status '${pr.status}' (must be 'open')`);
+	}
+
+	const approverId = ctx.props?.userId ?? 'anonymous';
+	const approverName = ctx.props?.displayName ?? 'agent';
+	const now = Date.now();
+
+	ctx.sql`
+		UPDATE pull_requests SET
+			status = 'approved',
+			approved_by_id = ${approverId},
+			approved_by_name = ${approverName},
+			approved_at = ${now},
+			updated_at = ${now}
+		WHERE id = ${prId}
+	`;
+
+	ctx.audit('approve_pull_request', 'pull_request', prId, {
+		approved_by: approverName,
+	});
+
+	return getPullRequest(ctx.sql, prId);
+}
+
+export interface MergeResult {
+	pull_request: PullRequestRow;
+	build_id?: string;
+}
+
+export async function handleMergePullRequest(
+	ctx: HandlerContext,
+	prId: string,
+	deploy: boolean,
+): Promise<MergeResult> {
+	const pr = getPullRequest(ctx.sql, prId);
+
+	if (pr.status !== 'approved') {
+		throw new Error(`Cannot merge pull request with status '${pr.status}' (must be 'approved')`);
+	}
+
+	const callerId = ctx.props?.userId ?? 'anonymous';
+	if (callerId !== pr.requested_by_id) {
+		throw new Error('Only the pull request requester can merge');
+	}
+
+	const repo = getRepo(ctx.sql, pr.repo_id);
+	const access = await mintAccess(ctx.env.ARTIFACTS, repo.artifacts_repo_name, 'write', 600);
+	const authedUrl = gitUrlWithToken(repo.git_url, access.token);
+
+	const { commitSha } = await performMerge(authedUrl, pr.base_branch, pr.head_branch, pr.requested_by_name);
+
+	const now = Date.now();
+	ctx.sql`
+		UPDATE pull_requests SET
+			status = 'merged',
+			merged_at = ${now},
+			merged_commit_sha = ${commitSha},
+			updated_at = ${now}
+		WHERE id = ${prId}
+	`;
+
+	ctx.audit('merge_pull_request', 'pull_request', prId, {
+		commit_sha: commitSha,
+		deploy,
+	});
+
+	const merged = getPullRequest(ctx.sql, prId);
+
+	if (!deploy) {
+		return { pull_request: merged };
+	}
+
+	// Create a build targeting the base branch (which now contains the merge)
+	const buildId = ulid();
+	ctx.sql`
+		INSERT INTO builds (id, repo_id, ref, status, created_at, updated_at)
+		VALUES (${buildId}, ${repo.id}, ${pr.base_branch}, 'queued', ${now}, ${now})
+	`;
+
+	return { pull_request: merged, build_id: buildId };
 }
