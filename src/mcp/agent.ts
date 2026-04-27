@@ -2,26 +2,14 @@ import { McpAgent } from 'agents/mcp';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import { SCHEMA } from '../db/schema';
-import type { BuildRow, DeploymentRow, PullRequestRow, RepoRow } from '../db/schema';
-import { getRepo, getBuild, getDeployment, getPullRequest, listPullRequests } from '../db/queries';
-import type { SqlRunner } from '../db/queries';
-import { ulid } from '../util/ids';
+import type { RepoRow } from '../db/schema';
+import { getRepoFromD1, listReposFromD1 } from '../db/queries';
 import { deleteRepo, mintAccess, gitUrlWithToken } from '../services/artifacts';
-import { runBuild } from '../builds/runner';
-import {
-	handleCreateRepo,
-	handlePromote,
-	handleCreatePullRequest,
-	handleGetPullRequest,
-	handleApprovePullRequest,
-	handleMergePullRequest,
-	runPromote,
-	type HandlerContext,
-} from './handlers';
+import { handleCreateRepo, type McpHandlerContext } from './handlers';
+import type { RepoDO } from '../do/repo';
 
 export interface AgentProps extends Record<string, unknown> {
-	userId: string;       // OAuth subject — also the DO id
+	userId: string;       // OAuth subject
 	displayName: string;
 }
 
@@ -31,15 +19,12 @@ const repoNameSchema = z
 	.max(48)
 	.regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/, 'letters, digits, ., _, - only (must not start with separator)');
 
-// workerName determines the deployed Worker's subdomain on *.workers.dev.
-// Cloudflare allows lowercase + digits + hyphens.
 const workerNameSchema = z
 	.string()
 	.min(3)
 	.max(58)
 	.regex(/^[a-z][a-z0-9-]*$/, 'lowercase letters, digits, hyphens, must start with letter');
 
-// State type unused — this agent persists via SQL only.
 export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProps> {
 	server = new McpServer({
 		name: 'github-for-agents',
@@ -47,34 +32,69 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 	});
 
 	async init(): Promise<void> {
-		// Idempotent schema bootstrap. Goes through the raw DO SQL API because
-		// `this.sql` turns every `${}` into a bound parameter, whereas DDL is
-		// purely a static string with multiple statements.
-		this.ctx.storage.sql.exec(SCHEMA);
-
-		const subject = this.props?.userId ?? 'unknown';
-		const displayName = this.props?.displayName ?? 'agent';
-		const now = Date.now();
-		this.sql`
-			INSERT INTO agent_self (id, name, created_at)
-			VALUES (${subject}, ${displayName}, ${now})
-			ON CONFLICT(id) DO UPDATE SET name = excluded.name
-		`;
-
 		this.registerTools();
 	}
 
-	private get handlerCtx(): HandlerContext {
+	private get userId(): string {
+		return this.props?.userId ?? 'unknown';
+	}
+
+	private get displayName(): string {
+		return this.props?.displayName ?? 'agent';
+	}
+
+	private get db(): D1Database {
+		return this.env.DB;
+	}
+
+	private getRepoDO(repoId: string): DurableObjectStub<RepoDO> {
+		const stub = this.env.REPO_OBJECT.get(
+			this.env.REPO_OBJECT.idFromName(repoId),
+		) as DurableObjectStub<RepoDO>;
+
+		// The Agents SDK can read stub.name internally; set it eagerly to avoid
+		// "Attempting to read .name ... before it was set" warnings/errors.
+		const namedStub = stub as DurableObjectStub<RepoDO> & { setName?: (name: string) => void };
+		namedStub.setName?.(repoId);
+		return stub;
+	}
+
+	private get handlerCtx(): McpHandlerContext {
 		return {
 			env: this.env,
-			sql: (strings, ...values) => this.sql(strings, ...values),
-			props: this.props,
-			audit: (action, targetType, targetId, metadata) => this.audit(action, targetType, targetId, metadata),
+			db: this.db,
+			userId: this.userId,
+			displayName: this.displayName,
+			getRepoDO: (repoId) => this.getRepoDO(repoId),
 		};
+	}
+
+	private asToolResult(value: unknown, pretty = true): { content: [{ type: 'text'; text: string }] } {
+		return {
+			content: [{
+				type: 'text',
+				text: pretty ? JSON.stringify(value, null, 2) : JSON.stringify(value),
+			}],
+		};
+	}
+
+	/**
+	 * Validate the caller owns the repo and return the D1 row.
+	 * Wrong owner intentionally maps to "not found" to avoid disclosing ownership.
+	 */
+	private async ownedRepo(repoId: string): Promise<RepoRow> {
+		const repo = await getRepoFromD1(this.db, repoId);
+		if (repo.owner_id !== this.userId) {
+			console.warn('[mcp] ownedRepo denied', { repoId, actor: this.userId, ownerId: repo.owner_id });
+			throw new Error(`repo ${repoId} not found`);
+		}
+		return repo;
 	}
 
 	private registerTools(): void {
 		const { server } = this;
+
+		// ── Repo CRUD (D1) ──────────────────────────────────────────
 
 		server.tool(
 			'create_repo',
@@ -86,7 +106,7 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 			},
 			async ({ name, worker_name, description }) => {
 				const result = await handleCreateRepo(this.handlerCtx, name, worker_name, description);
-				return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+				return this.asToolResult(result);
 			},
 		);
 
@@ -95,8 +115,8 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 			'List all repos owned by this agent.',
 			{},
 			async () => {
-				const rows = this.sql<RepoRow>`SELECT * FROM repos WHERE state != 'archived' ORDER BY created_at DESC`;
-				return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
+				const rows = await listReposFromD1(this.db, this.userId);
+				return this.asToolResult(rows);
 			},
 		);
 
@@ -109,21 +129,16 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 				ttl_seconds: z.number().int().min(60).max(86_400).default(3600),
 			},
 			async ({ repo_id, scope, ttl_seconds }) => {
-				const repo = getRepo(this.sqlRunner, repo_id);
+				const repo = await this.ownedRepo(repo_id);
 				const access = await mintAccess(this.env.ARTIFACTS, repo.artifacts_repo_name, scope, ttl_seconds);
-				return {
-					content: [{
-						type: 'text',
-						text: JSON.stringify({
-							git_url: gitUrlWithToken(repo.git_url, access.token),
-							remote: repo.git_url,
-							username: 'x-access-token',
-							token: access.token,
-							expires_at: access.expiresAt,
-							scope,
-						}, null, 2),
-					}],
-				};
+				return this.asToolResult({
+					git_url: gitUrlWithToken(repo.git_url, access.token),
+					remote: repo.git_url,
+					username: 'x-access-token',
+					token: access.token,
+					expires_at: access.expiresAt,
+					scope,
+				});
 			},
 		);
 
@@ -132,12 +147,14 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 			'Archive and delete a repo.',
 			{ repo_id: z.string() },
 			async ({ repo_id }) => {
-				const repo = getRepo(this.sqlRunner, repo_id);
+				const repo = await this.ownedRepo(repo_id);
 				const ok = await deleteRepo(this.env.ARTIFACTS, repo.artifacts_repo_name);
-				this.sql`UPDATE repos SET state = 'archived' WHERE id = ${repo_id}`;
-				return { content: [{ type: 'text', text: JSON.stringify({ ok }) }] };
+				await this.db.prepare("UPDATE repos SET state = 'archived' WHERE id = ?").bind(repo_id).run();
+				return this.asToolResult({ ok }, false);
 			},
 		);
+
+		// ── Build & Deploy (delegated to RepoDO) ────────────────────
 
 		server.tool(
 			'create_preview',
@@ -147,53 +164,50 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 				ref: z.string().default('main'),
 			},
 			async ({ repo_id, ref }) => {
-				const repo = getRepo(this.sqlRunner, repo_id);
-				const buildId = ulid();
-				const now = Date.now();
-				this.sql`
-					INSERT INTO builds (id, repo_id, ref, status, created_at, updated_at)
-					VALUES (${buildId}, ${repo_id}, ${ref}, 'queued', ${now}, ${now})
-				`;
-				await this.schedule(1, 'runPreviewBuild', { buildId, repoId: repo.id });
-				return { content: [{ type: 'text', text: JSON.stringify({ build_id: buildId, status: 'queued' }) }] };
+				await this.ownedRepo(repo_id);
+				const repoDO = this.getRepoDO(repo_id);
+				const result = await repoDO.createBuild(ref);
+				return this.asToolResult(result, false);
 			},
 		);
 
 		server.tool(
 			'get_preview_status',
 			'Get the current status of a build, including logs tail and preview_url when ready.',
-			{ build_id: z.string() },
-			async ({ build_id }) => {
-				const build = getBuild(this.sqlRunner, build_id);
-				return { content: [{ type: 'text', text: JSON.stringify(build, null, 2) }] };
+			{ build_id: z.string(), repo_id: z.string() },
+			async ({ build_id, repo_id }) => {
+				await this.ownedRepo(repo_id);
+				const repoDO = this.getRepoDO(repo_id);
+				const build = await repoDO.getBuildStatus(build_id);
+				return this.asToolResult(build);
 			},
 		);
 
 		server.tool(
 			'promote_preview',
 			'Promote a completed build to production by deploying its Worker version at 100% traffic.',
-			{ build_id: z.string() },
-			async ({ build_id }) => {
-				const result = await handlePromote(this.handlerCtx, build_id);
-				await this.schedule(1, 'runPromotePreview', {
-					buildId: build_id,
-					deploymentId: result.deployment_id,
-				});
-				return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+			{ build_id: z.string(), repo_id: z.string() },
+			async ({ build_id, repo_id }) => {
+				await this.ownedRepo(repo_id);
+				const repoDO = this.getRepoDO(repo_id);
+				const result = await repoDO.promote(build_id, this.displayName);
+				return this.asToolResult(result);
 			},
 		);
 
 		server.tool(
 			'get_deploy_status',
 			'Look up a deployment record.',
-			{ deployment_id: z.string() },
-			async ({ deployment_id }) => {
-				const deployment = getDeployment(this.sqlRunner, deployment_id);
-				return { content: [{ type: 'text', text: JSON.stringify(deployment, null, 2) }] };
+			{ deployment_id: z.string(), repo_id: z.string() },
+			async ({ deployment_id, repo_id }) => {
+				await this.ownedRepo(repo_id);
+				const repoDO = this.getRepoDO(repo_id);
+				const deployment = await repoDO.getDeploymentStatus(deployment_id);
+				return this.asToolResult(deployment);
 			},
 		);
 
-		// ── Pull Request tools ──────────────────────────────────────────
+		// ── Pull Request tools (delegated to RepoDO) ────────────────
 
 		server.tool(
 			'create_pull_request',
@@ -206,8 +220,17 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 				description: z.string().max(2000).optional(),
 			},
 			async ({ repo_id, head_branch, base_branch, title, description }) => {
-				const result = await handleCreatePullRequest(this.handlerCtx, repo_id, head_branch, base_branch, title, description);
-				return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+				await this.ownedRepo(repo_id);
+				const repoDO = this.getRepoDO(repo_id);
+				const result = await repoDO.createPullRequest({
+					headBranch: head_branch,
+					baseBranch: base_branch,
+					title,
+					description,
+					requesterId: this.userId,
+					requesterName: this.displayName,
+				});
+				return this.asToolResult(result);
 			},
 		);
 
@@ -216,29 +239,34 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 			'List pull requests for a repo, newest first (max 10).',
 			{ repo_id: z.string() },
 			async ({ repo_id }) => {
-				getRepo(this.sqlRunner, repo_id);
-				const rows = listPullRequests(this.sqlRunner, repo_id);
-				return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
+				await this.ownedRepo(repo_id);
+				const repoDO = this.getRepoDO(repo_id);
+				const rows = await repoDO.listRepoPullRequests();
+				return this.asToolResult(rows);
 			},
 		);
 
 		server.tool(
 			'get_pull_request',
 			'Get a pull request with a unified diff between head and base branches.',
-			{ pull_request_id: z.string() },
-			async ({ pull_request_id }) => {
-				const result = await handleGetPullRequest(this.handlerCtx, pull_request_id);
-				return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+			{ pull_request_id: z.string(), repo_id: z.string() },
+			async ({ pull_request_id, repo_id }) => {
+				await this.ownedRepo(repo_id);
+				const repoDO = this.getRepoDO(repo_id);
+				const result = await repoDO.getRepoPullRequest(pull_request_id);
+				return this.asToolResult(result);
 			},
 		);
 
 		server.tool(
 			'approve_pull_request',
 			'Approve a pull request. Only open PRs can be approved.',
-			{ pull_request_id: z.string() },
-			async ({ pull_request_id }) => {
-				const result = await handleApprovePullRequest(this.handlerCtx, pull_request_id);
-				return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+			{ pull_request_id: z.string(), repo_id: z.string() },
+			async ({ pull_request_id, repo_id }) => {
+				await this.ownedRepo(repo_id);
+				const repoDO = this.getRepoDO(repo_id);
+				const result = await repoDO.approvePullRequest(pull_request_id, this.userId, this.displayName);
+				return this.asToolResult(result);
 			},
 		);
 
@@ -247,94 +275,15 @@ export class AgentsMcpServer extends McpAgent<Cloudflare.Env, unknown, AgentProp
 			'Merge an approved pull request. Only the original requester can merge. Optionally triggers a build and deploy of the base branch.',
 			{
 				pull_request_id: z.string(),
+				repo_id: z.string(),
 				deploy: z.boolean().default(false),
 			},
-			async ({ pull_request_id, deploy }) => {
-				const result = await handleMergePullRequest(this.handlerCtx, pull_request_id, deploy);
-				if (result.build_id) {
-					const pr = result.pull_request;
-					await this.schedule(1, 'runMergeDeploy', {
-						buildId: result.build_id,
-						repoId: pr.repo_id,
-					});
-				}
-				return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+			async ({ pull_request_id, repo_id, deploy }) => {
+				await this.ownedRepo(repo_id);
+				const repoDO = this.getRepoDO(repo_id);
+				const result = await repoDO.mergePullRequest(pull_request_id, this.userId, deploy);
+				return this.asToolResult(result);
 			},
 		);
-	}
-
-	// ── Scheduled entry points ──────────────────────────────────────────
-
-	async runPreviewBuild(payload: { buildId: string; repoId: string }): Promise<void> {
-		const buildRows = this.sql<BuildRow>`SELECT * FROM builds WHERE id = ${payload.buildId}`;
-		if (buildRows.length === 0) return;
-		const repoRows = this.sql<RepoRow>`SELECT * FROM repos WHERE id = ${payload.repoId}`;
-		if (repoRows.length === 0) {
-			const now = Date.now();
-			this.sql`
-				UPDATE builds SET
-					status = 'failed',
-					error = 'repo not found',
-					updated_at = ${now}
-				WHERE id = ${payload.buildId}
-			`;
-			return;
-		}
-
-		await this.runFiber('preview-build', async () => {
-			await runBuild({
-				env: this.env,
-				sql: (strings, ...values) => this.sql(strings, ...values),
-				build: buildRows[0],
-				repo: repoRows[0],
-			});
-		});
-	}
-
-	async runPromotePreview(payload: { buildId: string; deploymentId: string }): Promise<void> {
-		await this.runFiber('promote-preview', async () => {
-			await runPromote(this.handlerCtx, payload.buildId, payload.deploymentId);
-		});
-	}
-
-	async runMergeDeploy(payload: { buildId: string; repoId: string }): Promise<void> {
-		const buildRows = this.sql<BuildRow>`SELECT * FROM builds WHERE id = ${payload.buildId}`;
-		if (buildRows.length === 0) return;
-		const repoRows = this.sql<RepoRow>`SELECT * FROM repos WHERE id = ${payload.repoId}`;
-		if (repoRows.length === 0) {
-			const now = Date.now();
-			this.sql`UPDATE builds SET status = 'failed', error = 'repo not found', updated_at = ${now} WHERE id = ${payload.buildId}`;
-			return;
-		}
-
-		await this.runFiber('merge-deploy', async () => {
-			// Run the build
-			await runBuild({
-				env: this.env,
-				sql: (strings, ...values) => this.sql(strings, ...values),
-				build: buildRows[0],
-				repo: repoRows[0],
-			});
-
-			// If build succeeded, auto-promote
-			const built = getBuild(this.sqlRunner, payload.buildId);
-			if (built.status !== 'complete' || !built.worker_version_id) return;
-
-			const result = await handlePromote(this.handlerCtx, payload.buildId);
-			await runPromote(this.handlerCtx, payload.buildId, result.deployment_id);
-		});
-	}
-
-	// ── Private helpers ─────────────────────────────────────────────────
-
-	private get sqlRunner(): SqlRunner {
-		return (strings, ...values) => this.sql(strings, ...values);
-	}
-
-	private audit(action: string, targetType: string, targetId: string, metadata: unknown): void {
-		this.sql`
-			INSERT INTO audit_log (action, target_type, target_id, metadata, ts)
-			VALUES (${action}, ${targetType}, ${targetId}, ${JSON.stringify(metadata)}, ${Date.now()})
-		`;
 	}
 }

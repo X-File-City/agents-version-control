@@ -1,22 +1,15 @@
-// Schema + typed helpers for the per-agent McpAgent Durable Object SQLite.
-// Every table is implicitly scoped to "this agent" because the DO is per-agent.
+// D1 schema is managed via migrations/0001_init.sql (users + repos tables).
+// This file defines the per-repo Durable Object SQLite schema and shared row types.
 
-export const SCHEMA = `
-CREATE TABLE IF NOT EXISTS agent_self (
-	id TEXT PRIMARY KEY,
+/** DDL for the per-repo RepoDO SQLite database (tables first, indexes last). */
+export const REPO_DO_SCHEMA = `
+CREATE TABLE IF NOT EXISTS repo_config (
+	repo_id TEXT PRIMARY KEY,
 	name TEXT NOT NULL,
-	created_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS repos (
-	id TEXT PRIMARY KEY,
-	name TEXT NOT NULL UNIQUE,
-	artifacts_repo_id TEXT NOT NULL,
 	artifacts_repo_name TEXT NOT NULL,
 	worker_name TEXT NOT NULL,
 	git_url TEXT NOT NULL,
-	default_branch TEXT NOT NULL DEFAULT 'main',
-	created_at INTEGER NOT NULL,
-	state TEXT NOT NULL DEFAULT 'ready'
+	default_branch TEXT NOT NULL DEFAULT 'main'
 );
 CREATE TABLE IF NOT EXISTS builds (
 	id TEXT PRIMARY KEY,
@@ -48,8 +41,6 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	metadata TEXT,
 	ts INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_builds_repo ON builds(repo_id);
-CREATE INDEX IF NOT EXISTS idx_deploys_repo ON deployments(repo_id);
 CREATE TABLE IF NOT EXISTS pull_requests (
 	id TEXT PRIMARY KEY,
 	repo_id TEXT NOT NULL,
@@ -68,20 +59,18 @@ CREATE TABLE IF NOT EXISTS pull_requests (
 	created_at INTEGER NOT NULL,
 	updated_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_builds_repo ON builds(repo_id);
+CREATE INDEX IF NOT EXISTS idx_deploys_repo ON deployments(repo_id);
 CREATE INDEX IF NOT EXISTS idx_pr_repo ON pull_requests(repo_id);
 `;
 
-// Row types — these reflect the SQL columns above.
+// ── Row types ───────────────────────────────────────────────────────
 
-export interface AgentSelfRow {
-	id: string;
-	name: string;
-	created_at: number;
-}
-
+/** Repo metadata stored in D1. */
 export interface RepoRow {
 	id: string;
 	name: string;
+	owner_id: string;
 	artifacts_repo_id: string;
 	artifacts_repo_name: string;
 	worker_name: string;
@@ -89,6 +78,16 @@ export interface RepoRow {
 	default_branch: string;
 	created_at: number;
 	state: 'ready' | 'archived';
+}
+
+/** Denormalized repo config stored in the RepoDO SQLite. */
+export interface RepoConfigRow {
+	repo_id: string;
+	name: string;
+	artifacts_repo_name: string;
+	worker_name: string;
+	git_url: string;
+	default_branch: string;
 }
 
 export type BuildStatus =
@@ -145,4 +144,11 @@ export interface PullRequestRow {
 	merged_commit_sha: string | null;
 	created_at: number;
 	updated_at: number;
+}
+
+/** D1 user row. */
+export interface UserRow {
+	id: string;
+	name: string;
+	created_at: number;
 }
