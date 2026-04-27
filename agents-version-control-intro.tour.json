@@ -1,13 +1,13 @@
 {
-  "id": "repomint-intro",
-  "title": "RepoMint: GitHub for Agents",
-  "description": "A guided walkthrough of the RepoMint MCP server — a Cloudflare Workers demo that lets authenticated agents create repos, run preview builds, and manage pull requests.",
+  "id": "agents-version-control-intro",
+  "title": "agents-version-control: GitHub for Agents",
+  "description": "A guided walkthrough of the agents-version-control MCP server — a Cloudflare Workers demo that lets authenticated agents create repos, run preview builds, and manage pull requests.",
   "version": "1.0.0",
   "steps": [
     {
       "id": "overview",
       "title": "Project Overview",
-      "description": "RepoMint is an MCP server running on Cloudflare Workers. It gives AI agents tools to manage Git repositories, seed Worker starter files, run preview builds, and merge pull requests. Built on Workers, Durable Objects, D1, and KV.",
+      "description": "This project is an MCP server running on Cloudflare Workers. It gives AI agents tools to manage Git repositories, seed Worker starter files, run preview builds, and merge pull requests. Built on Workers, Durable Objects, D1, and KV.",
       "focusDirectory": "",
       "colorMode": "fileTypes"
     },
