@@ -7,14 +7,14 @@
     {
       "id": "overview",
       "title": "Project Overview",
-      "description": "RepoMint is an MCP (Model Context Protocol) server running on Cloudflare Workers. It gives AI agents tools to manage Git repositories, seed Worker starter files, run preview builds, and merge pull requests. Built on Workers, Durable Objects, D1, and KV.",
+      "description": "RepoMint is an MCP server running on Cloudflare Workers. It gives AI agents tools to manage Git repositories, seed Worker starter files, run preview builds, and merge pull requests. Built on Workers, Durable Objects, D1, and KV.",
       "focusDirectory": "",
       "colorMode": "fileTypes"
     },
     {
       "id": "entry-and-config",
       "title": "Worker Entry & Configuration",
-      "description": "The Worker boots from src/index.ts, with src/config.ts handling environment-driven configuration and src/oauth.ts wiring up the @cloudflare/workers-oauth-provider flow. wrangler.jsonc declares the Durable Object, D1, and KV bindings.",
+      "description": "The Worker boots from a single entry point, with environment-driven configuration and the OAuth provider wired up alongside it. The Wrangler config declares the Durable Object, D1, and KV bindings the rest of the app depends on.",
       "focusDirectory": "",
       "highlightLayers": [
         {
@@ -35,14 +35,14 @@
     {
       "id": "mcp-layer",
       "title": "MCP Agent Surface",
-      "description": "src/mcp is the agent-facing API. agent.ts defines the MCP agent built on the Cloudflare Agents SDK, and handlers.ts implements the tool methods agents call to manipulate repos.",
+      "description": "This is the agent-facing API. One module defines the MCP agent built on the Cloudflare Agents SDK, and another implements the tool methods agents call to manipulate repos.",
       "focusDirectory": "src/mcp",
       "colorMode": "fileTypes"
     },
     {
       "id": "durable-objects",
       "title": "Per-Repo Durable Object",
-      "description": "src/do/repo.ts is the Durable Object that owns per-repository state. Each repo gets a single coordinator instance — making git operations, build runs, and PR state safely serialized per repo.",
+      "description": "A Durable Object owns per-repository state. Each repo gets a single coordinator instance, which keeps git operations, build runs, and pull request state safely serialized per repo.",
       "focusDirectory": "src/do",
       "highlightLayers": [
         {
@@ -60,14 +60,14 @@
     {
       "id": "services",
       "title": "Services Layer",
-      "description": "src/services holds the operational glue: git-ops.ts wraps isomorphic-git over an in-memory FS, repo-seed.ts seeds new repos with starter files, sandbox.ts and wrangler-run.ts execute preview/deploy builds via @cloudflare/sandbox, and artifacts.ts manages build outputs.",
+      "description": "The services layer holds the operational glue: a git wrapper running over an in-memory filesystem, a seeder that bootstraps new repos with starter files, sandboxed runners that execute preview and deploy builds, and an artifacts module that manages build outputs.",
       "focusDirectory": "src/services",
       "colorMode": "fileTypes"
     },
     {
       "id": "data-layer",
       "title": "D1 Database Layer",
-      "description": "src/db contains the control-plane persistence: schema.ts defines the D1 tables and queries.ts wraps typed access patterns. Schema changes flow through the migrations/ directory.",
+      "description": "Control-plane persistence lives here. One module defines the D1 tables, another wraps typed access patterns, and schema changes flow through the migrations directory.",
       "focusDirectory": "",
       "highlightLayers": [
         {
@@ -86,14 +86,14 @@
     {
       "id": "tests",
       "title": "Tests & Tooling",
-      "description": "Tests run on @cloudflare/vitest-pool-workers, which executes tests inside the Workers runtime so bindings (DOs, D1, KV) behave like production. test/index.spec.ts is the entry test file.",
+      "description": "Tests run inside the Workers runtime via the Cloudflare vitest pool, so Durable Objects, D1, and KV bindings behave like production.",
       "focusDirectory": "test",
       "colorMode": "fileTypes"
     },
     {
       "id": "next-steps",
       "title": "Next Steps",
-      "description": "To run locally: `npm install && npm run dev`. To deploy: `npm run deploy`. After changing bindings in wrangler.jsonc, run `npm run cf-typegen` to regenerate Worker types. See README.md for demo caveats — this is a proof-of-concept, not production-hardened.",
+      "description": "Run locally with the dev script and deploy with the deploy script. After changing bindings, regenerate Worker types. See the README for demo caveats — this is a proof-of-concept, not production-hardened.",
       "focusDirectory": "",
       "colorMode": "fileTypes"
     }
