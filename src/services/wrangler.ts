@@ -3,10 +3,11 @@
 // Kept free of Workers/Sandbox imports so these can be unit-tested in plain
 // Node. The sandbox-invocation wrapper lives in `./wrangler-run.ts`.
 
+import { CLOUDFLARE_ACCOUNT_ID } from '../config';
+
 // A minimal wrangler.jsonc we commit as the initial repo payload so that
 // `wrangler versions upload` works out-of-the-box. The agent is free to
 // replace it with anything valid.
-export const CLOUDFLARE_ACCOUNT_ID = 'd32e32cb20387d14c4f45965620063cc';
 
 export function initialWranglerConfig(workerName: string): string {
 	const config = {

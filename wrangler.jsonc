@@ -1,11 +1,10 @@
 /**
  * GitHub for Agents — control plane Worker.
- * See /Users/ashley.peacock/.claude/plans/drifting-seeking-pearl.md
+ * Local setup notes live in README and migration files in this repo.
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "github-for-agents",
-	"account_id": "d32e32cb20387d14c4f45965620063cc",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-04-23",
 	"compatibility_flags": ["nodejs_compat"],
@@ -15,7 +14,8 @@
 	"durable_objects": {
 		"bindings": [
 			{ "name": "MCP_OBJECT", "class_name": "AgentsMcpServer" },
-			{ "name": "SANDBOX", "class_name": "Sandbox" }
+			{ "name": "SANDBOX", "class_name": "Sandbox" },
+			{ "name": "REPO_OBJECT", "class_name": "RepoDO" }
 		]
 	},
 
@@ -23,6 +23,10 @@
 		{
 			"tag": "v1",
 			"new_sqlite_classes": ["AgentsMcpServer", "Sandbox"]
+		},
+		{
+			"tag": "v2",
+			"new_sqlite_classes": ["RepoDO"]
 		}
 	],
 
@@ -33,6 +37,10 @@
 			"instance_type": "lite",
 			"max_instances": 2
 		}
+	],
+
+	"d1_databases": [
+		{ "binding": "DB", "database_name": "github-for-agents-db", "database_id": "340f47cc-1ada-4b19-9499-71df90065faf" }
 	],
 
 	"kv_namespaces": [

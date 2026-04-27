@@ -1,5 +1,5 @@
 import { sh, type SandboxHandle, type ShellResult } from './sandbox';
-import { CLOUDFLARE_ACCOUNT_ID } from './wrangler';
+import { CLOUDFLARE_ACCOUNT_ID } from '../config';
 
 // Run wrangler with CF creds passed directly into sandbox command env.
 

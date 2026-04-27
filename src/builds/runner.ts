@@ -4,59 +4,109 @@
 // Triggered from the agent via durable execution (`runFiber`). Detects project type, invokes the right install
 // + build + upload commands inside a sandbox, and records progress in SQL.
 
-import type { Sandbox as SandboxType } from '@cloudflare/sandbox';
 import { mintAccess, gitUrlWithToken } from '../services/artifacts';
-import { sandboxFor, sh, tailLogs, gitCheckout, type ShellResult } from '../services/sandbox';
-import { CLOUDFLARE_ACCOUNT_ID, parseVersionsUpload, parseWorkersScriptList } from '../services/wrangler';
+import {
+	sandboxFor,
+	sandboxIdForBuild,
+	sandboxNamespace,
+	sh,
+	tailLogs,
+	gitCheckout,
+	type ShellResult,
+} from '../services/sandbox';
+import { parseVersionsUpload, parseWorkersScriptList } from '../services/wrangler';
+import { CLOUDFLARE_ACCOUNT_ID } from '../config';
 import { wrangler } from '../services/wrangler-run';
-import type { BuildRow, BuildStatus, RepoRow } from '../db/schema';
+import { errorMessage } from '../util/errors';
+import type { SqlRunner } from '../db/queries';
+import type { BuildRow, BuildStatus } from '../db/schema';
 
-export interface SqlRunner {
-	// Tagged-template SQL API exposed by McpAgent.
-	<T = Record<string, string | number | boolean | null>>(
-		strings: TemplateStringsArray,
-		...values: (string | number | boolean | null)[]
-	): T[];
+/** Minimal repo info required by the build runner. */
+export interface BuildRepoInfo {
+	id: string;
+	artifacts_repo_name: string;
+	git_url: string;
+	worker_name: string;
 }
 
 interface RunBuildArgs {
 	env: Cloudflare.Env;
 	sql: SqlRunner;
 	build: BuildRow;
-	repo: RepoRow;
+	repo: BuildRepoInfo;
 }
 
 const WORKDIR = '/workspace/repo';
 const WRANGLER_UPLOAD_TIMEOUT_MS = 900_000;
 
-export async function runBuild({ env, sql, build, repo }: RunBuildArgs): Promise<void> {
-	const sb = sandboxFor(
-		env.SANDBOX as unknown as DurableObjectNamespace<SandboxType>,
-		build.id,
-	);
-	const logPrefix = `[build:${build.id}]`;
+interface BuildRunContext {
+	env: Cloudflare.Env;
+	sql: SqlRunner;
+	build: BuildRow;
+	repo: BuildRepoInfo;
+	sb: ReturnType<typeof sandboxFor>;
+	logPrefix: string;
+	logs: string[];
+	recordStep: (step: string, result: ShellResult) => void;
+	setStatus: (status: BuildStatus, extra?: Partial<BuildRow>) => void;
+	summarizeFailure: (summary: string, result: ShellResult) => string;
+}
 
+export async function runBuild(args: RunBuildArgs): Promise<void> {
+	const ctx = createBuildRunContext(args);
+
+	try {
+		const cloneResult = await runClonePhase(ctx);
+		if (!cloneResult.ok) return;
+
+		const detection = await runDetectAndInstallPhase(ctx, cloneResult.commitSha);
+		if (!detection) return;
+
+		const built = await runBuildPhase(ctx, detection);
+		if (!built) return;
+
+		const uploaded = await runUploadPhase(ctx);
+		if (!uploaded) return;
+
+		ctx.setStatus('complete', {
+			worker_version_id: uploaded.versionId,
+			preview_url: uploaded.previewUrl,
+		});
+	} catch (err) {
+		const debugDetail = err instanceof Error ? err.stack ?? err.message : String(err);
+		ctx.logs.push(`[uncaught]\n${debugDetail}\n`);
+		console.error(`${ctx.logPrefix} uncaught error\n${debugDetail}`);
+		ctx.setStatus('failed', { error: formatUncaughtClientError(err) });
+	}
+}
+
+function createBuildRunContext({ env, sql, build, repo }: RunBuildArgs): BuildRunContext {
+	const sb = sandboxFor(sandboxNamespace(env), sandboxIdForBuild(build.id));
+	const logPrefix = `[build:${build.id}]`;
 	const logs: string[] = [];
-	const isTimeoutLikeFailure = (r: ShellResult): boolean => {
-		const detail = `${r.stderr}\n${r.stdout}`;
+
+	const isTimeoutLikeFailure = (result: ShellResult): boolean => {
+		const detail = `${result.stderr}\n${result.stdout}`;
 		return /command timeout|timed out|\/api\/execute 500/i.test(detail);
 	};
-	const summarizeFailure = (summary: string, r: ShellResult): string => {
-		if (isTimeoutLikeFailure(r)) {
-			const detail = (r.stderr || r.stdout).trim();
+
+	const summarizeFailure = (summary: string, result: ShellResult): string => {
+		if (isTimeoutLikeFailure(result)) {
+			const detail = (result.stderr || result.stdout).trim();
 			if (!detail) return `${summary}: command timed out while waiting for sandbox exec`;
 			return `${summary}: command timed out while waiting for sandbox exec (${tailLogs(detail, 400)})`;
 		}
-		const detail = (r.stderr || r.stdout).trim();
+		const detail = (result.stderr || result.stdout).trim();
 		if (!detail) return summary;
 		return `${summary}: ${tailLogs(detail, 500)}`;
 	};
-	const recordStep = (step: string, r: ShellResult): void => {
-		logs.push(`$ ${step}\n${r.stdout}${r.stderr ? '\n[stderr]\n' + r.stderr : ''}\nexit=${r.exitCode}\n`);
-		const level = r.success ? 'info' : 'warn';
-		console[level](`${logPrefix} ${step} -> exit=${r.exitCode}`);
-		if (r.stderr.trim()) {
-			console.warn(`${logPrefix} ${step} stderr:\n${tailLogs(r.stderr)}`);
+
+	const recordStep = (step: string, result: ShellResult): void => {
+		logs.push(`$ ${step}\n${result.stdout}${result.stderr ? '\n[stderr]\n' + result.stderr : ''}\nexit=${result.exitCode}\n`);
+		const level = result.success ? 'info' : 'warn';
+		console[level](`${logPrefix} ${step} -> exit=${result.exitCode}`);
+		if (result.stderr.trim()) {
+			console.warn(`${logPrefix} ${step} stderr:\n${tailLogs(result.stderr)}`);
 		}
 	};
 
@@ -84,128 +134,153 @@ export async function runBuild({ env, sql, build, repo }: RunBuildArgs): Promise
 		`;
 	};
 
-	try {
-		// 1. Clone
-		setStatus('cloning');
-		const access = await mintAccess(env.ARTIFACTS, repo.artifacts_repo_name, 'write', 900);
-		const authedUrl = gitUrlWithToken(repo.git_url, access.token);
-		const clearDir = await sh(sb, `rm -rf ${WORKDIR}`);
-		recordStep(`rm -rf ${WORKDIR}`, clearDir);
-		const nativeClone = await gitCheckout(sb, authedUrl, { targetDir: WORKDIR });
-		recordStep(`sandbox gitCheckout <remote> ${WORKDIR}`, nativeClone);
-		if (!nativeClone.success) {
-			setStatus('failed', { error: summarizeFailure('clone failed via sandbox gitCheckout', nativeClone) });
-			return;
-		}
-		const checkout = await sh(sb, `git checkout ${build.ref}`, { cwd: WORKDIR });
-		recordStep(`git checkout ${build.ref}`, checkout);
-		if (!checkout.success) {
-			setStatus('failed', { error: summarizeFailure('checkout failed', checkout) });
-			return;
-		}
+	return {
+		env,
+		sql,
+		build,
+		repo,
+		sb,
+		logPrefix,
+		logs,
+		recordStep,
+		setStatus,
+		summarizeFailure,
+	};
+}
 
-		const rev = await sh(sb, 'git rev-parse HEAD', { cwd: WORKDIR });
-		recordStep('git rev-parse HEAD', rev);
-		const commitSha = rev.stdout.trim() || null;
+function failBuild(ctx: BuildRunContext, error: string, extra?: Partial<BuildRow>): false {
+	ctx.setStatus('failed', { ...extra, error });
+	return false;
+}
 
-		// 2. Detect + install
-		const detection = await detectProject(sb);
-		logs.push(`[detected: ${detection.kind}]\n`);
-		console.info(`${logPrefix} detected project`, detection);
+async function runClonePhase(ctx: BuildRunContext): Promise<{ ok: true; commitSha: string | null } | { ok: false }> {
+	ctx.setStatus('cloning');
+	const access = await mintAccess(ctx.env.ARTIFACTS, ctx.repo.artifacts_repo_name, 'write', 900);
+	const authedUrl = gitUrlWithToken(ctx.repo.git_url, access.token);
+	const clearDir = await sh(ctx.sb, `rm -rf ${WORKDIR}`);
+	ctx.recordStep(`rm -rf ${WORKDIR}`, clearDir);
+	const nativeClone = await gitCheckout(ctx.sb, authedUrl, { targetDir: WORKDIR });
+	ctx.recordStep(`sandbox gitCheckout <remote> ${WORKDIR}`, nativeClone);
+	if (!nativeClone.success) {
+		return { ok: failBuild(ctx, ctx.summarizeFailure('clone failed via sandbox gitCheckout', nativeClone)) };
+	}
 
-		if (detection.kind === 'unknown') {
-			setStatus('failed', { commit_sha: commitSha, error: 'no wrangler.jsonc/toml, package.json, or /bin/build found' });
-			return;
-		}
+	const checkout = await sh(ctx.sb, `git checkout ${ctx.build.ref}`, { cwd: WORKDIR });
+	ctx.recordStep(`git checkout ${ctx.build.ref}`, checkout);
+	if (!checkout.success) {
+		return { ok: failBuild(ctx, ctx.summarizeFailure('checkout failed', checkout)) };
+	}
 
-		setStatus('installing', { commit_sha: commitSha });
-		if (detection.hasPackageJson) {
-			const install = await sh(sb, 'npm install --no-audit --no-fund', { cwd: WORKDIR, timeoutMs: 300_000 });
-			recordStep('npm install', install);
-			if (!install.success) {
-				setStatus('failed', { error: summarizeFailure('npm install failed', install) });
-				return;
-			}
-		}
+	const rev = await sh(ctx.sb, 'git rev-parse HEAD', { cwd: WORKDIR });
+	ctx.recordStep('git rev-parse HEAD', rev);
+	return { ok: true, commitSha: rev.stdout.trim() || null };
+}
 
-		// 3. Build (optional)
-		setStatus('bundling');
-		if (detection.kind === 'custom') {
-			const buildRes = await sh(sb, '/bin/build', { cwd: WORKDIR, timeoutMs: 300_000 });
-			recordStep('/bin/build', buildRes);
-			if (!buildRes.success) {
-				setStatus('failed', { error: summarizeFailure('/bin/build failed', buildRes) });
-				return;
-			}
-		} else if (detection.hasPackageJson && detection.hasBuildScript) {
-			const buildRes = await sh(sb, 'npm run build', { cwd: WORKDIR, timeoutMs: 300_000 });
-			recordStep('npm run build', buildRes);
-			if (!buildRes.success) {
-				setStatus('failed', { error: summarizeFailure('npm run build failed', buildRes) });
-				return;
-			}
-		}
+async function runDetectAndInstallPhase(ctx: BuildRunContext, commitSha: string | null): Promise<Detection | null> {
+	const detection = await detectProject(ctx.sb);
+	ctx.logs.push(`[detected: ${detection.kind}]\n`);
+	console.info(`${ctx.logPrefix} detected project`, detection);
 
-		// 4. Upload preview version via wrangler using a real API token passed
-		//    directly into the sandbox command environment.
-		setStatus('uploading');
-		const apiToken = (env as Cloudflare.Env & { API_TOKEN?: string }).API_TOKEN;
-		if (!apiToken) {
-			setStatus('failed', { error: 'missing API_TOKEN secret' });
-			return;
+	if (detection.kind === 'unknown') {
+		failBuild(ctx, 'no wrangler.jsonc/toml, package.json, or /bin/build found', { commit_sha: commitSha });
+		return null;
+	}
+
+	ctx.setStatus('installing', { commit_sha: commitSha });
+	if (!detection.hasPackageJson) return detection;
+
+	const install = await sh(ctx.sb, 'npm install --no-audit --no-fund', { cwd: WORKDIR, timeoutMs: 300_000 });
+	ctx.recordStep('npm install', install);
+	if (!install.success) {
+		failBuild(ctx, ctx.summarizeFailure('npm install failed', install));
+		return null;
+	}
+
+	return detection;
+}
+
+async function runBuildPhase(ctx: BuildRunContext, detection: Detection): Promise<boolean> {
+	ctx.setStatus('bundling');
+	if (detection.kind === 'custom') {
+		const buildResult = await sh(ctx.sb, '/bin/build', { cwd: WORKDIR, timeoutMs: 300_000 });
+		ctx.recordStep('/bin/build', buildResult);
+		if (!buildResult.success) {
+			return failBuild(ctx, ctx.summarizeFailure('/bin/build failed', buildResult));
 		}
-		const workerCheck = await ensureWorkerScriptExists({
-			apiToken,
-			workerName: repo.worker_name,
-		});
-		if (workerCheck.error) {
-			setStatus('failed', { error: workerCheck.error });
-			return;
-		}
-		if (!workerCheck.exists) {
-			logs.push(`[bootstrap] worker "${repo.worker_name}" not found remotely; deploying once before preview upload\n`);
-			const deploy = await wrangler(
-				sb,
-				'deploy',
-				WORKDIR,
-				apiToken,
-				WRANGLER_UPLOAD_TIMEOUT_MS,
-			);
-			recordStep('wrangler deploy (bootstrap missing worker)', deploy);
-			if (!deploy.success) {
-				setStatus('failed', { error: summarizeFailure('wrangler deploy failed while bootstrapping worker', deploy) });
-				return;
-			}
-		}
-		const upload = await wrangler(
-			sb,
-			`versions upload --message "gh-for-agents build ${build.id}"`,
+		return true;
+	}
+
+	if (!detection.hasPackageJson || !detection.hasBuildScript) return true;
+
+	const buildResult = await sh(ctx.sb, 'npm run build', { cwd: WORKDIR, timeoutMs: 300_000 });
+	ctx.recordStep('npm run build', buildResult);
+	if (!buildResult.success) {
+		return failBuild(ctx, ctx.summarizeFailure('npm run build failed', buildResult));
+	}
+	return true;
+}
+
+async function runUploadPhase(
+	ctx: BuildRunContext,
+): Promise<{ versionId: string; previewUrl: string | null } | null> {
+	// Upload preview version via wrangler with the API token passed into sandbox env.
+	ctx.setStatus('uploading');
+	const apiToken = ctx.env.API_TOKEN;
+	if (!apiToken) {
+		failBuild(ctx, 'missing API_TOKEN secret');
+		return null;
+	}
+
+	const workerCheck = await ensureWorkerScriptExists({
+		apiToken,
+		workerName: ctx.repo.worker_name,
+	});
+	if (workerCheck.error) {
+		failBuild(ctx, workerCheck.error);
+		return null;
+	}
+
+	if (!workerCheck.exists) {
+		ctx.logs.push(`[bootstrap] worker "${ctx.repo.worker_name}" not found remotely; deploying once before preview upload\n`);
+		const deploy = await wrangler(
+			ctx.sb,
+			'deploy',
 			WORKDIR,
 			apiToken,
 			WRANGLER_UPLOAD_TIMEOUT_MS,
 		);
-		recordStep('wrangler versions upload', upload);
-		if (!upload.success) {
-			setStatus('failed', { error: summarizeFailure('wrangler versions upload failed', upload) });
-			return;
+		ctx.recordStep('wrangler deploy (bootstrap missing worker)', deploy);
+		if (!deploy.success) {
+			failBuild(ctx, ctx.summarizeFailure('wrangler deploy failed while bootstrapping worker', deploy));
+			return null;
 		}
-
-		const parsed = parseVersionsUpload(upload.stdout);
-		if (!parsed) {
-			setStatus('failed', { error: 'could not parse wrangler output' });
-			return;
-		}
-
-		setStatus('complete', {
-			worker_version_id: parsed.versionId,
-			preview_url: parsed.previewUrl,
-		});
-	} catch (err) {
-		const msg = err instanceof Error ? err.stack ?? err.message : String(err);
-		logs.push(`[uncaught]\n${msg}\n`);
-		console.error(`${logPrefix} uncaught error\n${msg}`);
-		setStatus('failed', { error: 'uncaught error' });
 	}
+
+	const upload = await wrangler(
+		ctx.sb,
+		`versions upload --message "gh-for-agents build ${ctx.build.id}"`,
+		WORKDIR,
+		apiToken,
+		WRANGLER_UPLOAD_TIMEOUT_MS,
+	);
+	ctx.recordStep('wrangler versions upload', upload);
+	if (!upload.success) {
+		failBuild(ctx, ctx.summarizeFailure('wrangler versions upload failed', upload));
+		return null;
+	}
+
+	const parsed = parseVersionsUpload(upload.stdout);
+	if (!parsed) {
+		failBuild(ctx, 'could not parse wrangler output');
+		return null;
+	}
+
+	return parsed;
+}
+
+function formatUncaughtClientError(err: unknown): string {
+	const reason = errorMessage(err);
+	return reason ? `uncaught error: ${tailLogs(reason, 200)}` : 'uncaught error';
 }
 
 async function ensureWorkerScriptExists(args: {
@@ -224,10 +299,9 @@ async function ensureWorkerScriptExists(args: {
 			},
 		);
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
 		return {
 			exists: false,
-			error: `workers/scripts lookup failed: ${message}`,
+			error: `workers/scripts lookup failed: ${errorMessage(err)}`,
 		};
 	}
 	if (!res.ok) {
