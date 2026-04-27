@@ -1,100 +1,110 @@
 {
   "id": "repomint-intro",
   "title": "RepoMint: GitHub for Agents",
-  "description": "A guided walkthrough of the RepoMint MCP server — a Cloudflare Workers demo that lets authenticated agents create repos, run preview builds, and manage pull requests.",
+  "description": "A guided walkthrough of the RepoMint MCP server — a Cloudflare Workers demo that lets agents create repos, run preview builds, and manage pull requests.",
   "version": "1.0.0",
+  "audience": "New Users & AI Assistants",
   "steps": [
     {
-      "id": "overview",
+      "id": "step-1-overview",
       "title": "Project Overview",
       "description": "RepoMint is an MCP (Model Context Protocol) server running on Cloudflare Workers. It gives AI agents tools to manage Git repositories, seed Worker starter files, run preview builds, and merge pull requests. Built on Workers, Durable Objects, D1, and KV.",
-      "focusDirectory": "",
+      "estimatedTime": 30,
+      "highlightFiles": [
+        "README.md",
+        "AGENTS.md",
+        "package.json",
+        "wrangler.jsonc"
+      ],
       "colorMode": "fileTypes"
     },
     {
-      "id": "entry-and-config",
+      "id": "step-2-entry-and-config",
       "title": "Worker Entry & Configuration",
-      "description": "The Worker boots from src/index.ts, with src/config.ts handling environment-driven configuration and src/oauth.ts wiring up the @cloudflare/workers-oauth-provider flow. wrangler.jsonc declares the Durable Object, D1, and KV bindings.",
-      "focusDirectory": "",
-      "highlightLayers": [
-        {
-          "id": "entry-points",
-          "name": "Entry Points & Config",
-          "color": "#3b82f6",
-          "items": [
-            { "path": "src/index.ts", "type": "file" },
-            { "path": "src/config.ts", "type": "file" },
-            { "path": "src/oauth.ts", "type": "file" },
-            { "path": "wrangler.jsonc", "type": "file" }
-          ],
-          "opacity": 0.75,
-          "renderStrategy": "border"
-        }
-      ]
+      "description": "The Worker boots from src/index.ts, with src/config.ts handling configuration and src/oauth.ts wiring up the @cloudflare/workers-oauth-provider flow. wrangler.jsonc declares the Durable Object, D1, and KV bindings.",
+      "estimatedTime": 60,
+      "focusDirectory": "src",
+      "highlightFiles": [
+        "src/index.ts",
+        "src/config.ts",
+        "src/oauth.ts"
+      ],
+      "colorMode": "fileTypes"
     },
     {
-      "id": "mcp-layer",
+      "id": "step-3-mcp-layer",
       "title": "MCP Agent Surface",
       "description": "src/mcp is the agent-facing API. agent.ts defines the MCP agent built on the Cloudflare Agents SDK, and handlers.ts implements the tool methods agents call to manipulate repos.",
+      "estimatedTime": 60,
       "focusDirectory": "src/mcp",
+      "highlightFiles": [
+        "src/mcp/agent.ts",
+        "src/mcp/handlers.ts"
+      ],
       "colorMode": "fileTypes"
     },
     {
-      "id": "durable-objects",
+      "id": "step-4-durable-objects",
       "title": "Per-Repo Durable Object",
       "description": "src/do/repo.ts is the Durable Object that owns per-repository state. Each repo gets a single coordinator instance — making git operations, build runs, and PR state safely serialized per repo.",
+      "estimatedTime": 45,
       "focusDirectory": "src/do",
-      "highlightLayers": [
-        {
-          "id": "do-core",
-          "name": "Repo Durable Object",
-          "color": "#a855f7",
-          "items": [
-            { "path": "src/do/repo.ts", "type": "file" }
-          ],
-          "opacity": 0.8,
-          "renderStrategy": "border"
-        }
-      ]
+      "highlightFiles": [
+        "src/do/repo.ts"
+      ],
+      "colorMode": "fileTypes"
     },
     {
-      "id": "services",
+      "id": "step-5-services",
       "title": "Services Layer",
       "description": "src/services holds the operational glue: git-ops.ts wraps isomorphic-git over an in-memory FS, repo-seed.ts seeds new repos with starter files, sandbox.ts and wrangler-run.ts execute preview/deploy builds via @cloudflare/sandbox, and artifacts.ts manages build outputs.",
+      "estimatedTime": 75,
       "focusDirectory": "src/services",
+      "highlightFiles": [
+        "src/services/git-ops.ts",
+        "src/services/repo-seed.ts",
+        "src/services/sandbox.ts",
+        "src/services/wrangler.ts",
+        "src/services/wrangler-run.ts",
+        "src/services/artifacts.ts"
+      ],
       "colorMode": "fileTypes"
     },
     {
-      "id": "data-layer",
+      "id": "step-6-data-layer",
       "title": "D1 Database Layer",
-      "description": "src/db contains the control-plane persistence: schema.ts defines the D1 tables and queries.ts wraps typed access patterns. Schema changes flow through the migrations/ directory.",
-      "focusDirectory": "",
-      "highlightLayers": [
-        {
-          "id": "data",
-          "name": "Database & Migrations",
-          "color": "#10b981",
-          "items": [
-            { "path": "src/db", "type": "directory" },
-            { "path": "migrations", "type": "directory" }
-          ],
-          "opacity": 0.75,
-          "renderStrategy": "border"
-        }
-      ]
+      "description": "src/db contains control-plane persistence: schema.ts defines the D1 tables and queries.ts wraps typed access patterns. Schema changes flow through the migrations/ directory.",
+      "estimatedTime": 45,
+      "focusDirectory": "src/db",
+      "highlightFiles": [
+        "src/db/schema.ts",
+        "src/db/queries.ts",
+        "migrations/0001_init.sql"
+      ],
+      "colorMode": "fileTypes"
     },
     {
-      "id": "tests",
+      "id": "step-7-tests",
       "title": "Tests & Tooling",
       "description": "Tests run on @cloudflare/vitest-pool-workers, which executes tests inside the Workers runtime so bindings (DOs, D1, KV) behave like production. test/index.spec.ts is the entry test file.",
+      "estimatedTime": 30,
       "focusDirectory": "test",
+      "highlightFiles": [
+        "test/index.spec.ts",
+        "vitest.config.mts"
+      ],
       "colorMode": "fileTypes"
     },
     {
-      "id": "next-steps",
+      "id": "step-8-next-steps",
       "title": "Next Steps",
-      "description": "To run locally: `npm install && npm run dev`. To deploy: `npm run deploy`. After changing bindings in wrangler.jsonc, run `npm run cf-typegen` to regenerate Worker types. See README.md for demo caveats — this is a proof-of-concept, not production-hardened.",
+      "description": "To run locally: npm install && npm run dev. To deploy: npm run deploy. After changing bindings in wrangler.jsonc, run npm run cf-typegen to regenerate Worker types. See README.md for demo caveats — this is a proof-of-concept, not production-hardened.",
+      "estimatedTime": 30,
       "focusDirectory": "",
+      "highlightFiles": [
+        "README.md",
+        "package.json"
+      ],
       "colorMode": "fileTypes"
     }
   ]
